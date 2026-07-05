@@ -8,17 +8,12 @@
   "router_name": "WifiAP-01",
 
   "enable_wifi_tracking": true,
-  "wifi_tracking_mode": "local",
-  "wifi_poll_interval": 2,
-  "wifi_grace_seconds": 60,
-
-  "_comment_central_mode_only": "The 4 keys below are only used when wifi_tracking_mode is \"central\" (see README) - harmless to leave as-is otherwise.",
   "wifi_central_syslog_source_pattern": "WifiAP-\\w+",
   "wifi_central_grace_seconds": 60,
   "wifi_central_ap_timeout_seconds": 1200,
   "wifi_central_local_resync_seconds": 90,
 
-  "_comment_satellite_heartbeat": "Enable ONLY on a satellite AP in central mode, INSTEAD of enable_wifi_tracking - see README 'Handling missed events'.",
+  "_comment_satellite_heartbeat": "Enable ONLY on a satellite AP, INSTEAD of enable_wifi_tracking - see README 'Handling missed events'.",
   "enable_wifi_heartbeat": false,
   "wifi_heartbeat_interval": 60,
   "wifi_heartbeat_miss_threshold": 2,
@@ -32,8 +27,8 @@
   "wired_ping_timeout": 2,
   "wired_ping_failures": 3,
 
+  "_comment_leases": "dhcp_leases_file is only used to resolve hostnames when enable_wifi_tracking or enable_wired_tracking is true - a satellite running ONLY enable_wifi_heartbeat never reads it, so leave it out of its config.",
   "dhcp_leases_file": "/tmp/dhcp.leases",
-  "uci_dhcp_file": "/etc/config/dhcp",
 
   "log_level": "INFO"
 

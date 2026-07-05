@@ -1,0 +1,59 @@
+# syslog-ng config for a SATELLITE AP (enable_wifi_tracking=false,
+# enable_wifi_heartbeat=true - see README).
+#
+# Role: forward this AP's own hostapd/kernel events to the main router
+# over UDP 514, so its CentralWifiTracker can see them via `logread -f`.
+# Replace IP_ROUTER below with the main router's actual LAN IP.
+
+@version: current
+@include "scl.conf"
+
+options {
+	chain_hostnames(no);
+	create_dirs(yes);
+	keep_hostname(yes);
+	log_fifo_size(256);
+	log_msg_size(1024);
+	stats(freq(0));
+	flush_lines(0);
+	use_fqdn(no);
+};
+
+# syslog-ng gets messages from syslog-ng (internal) and from /dev/log
+source src {
+	internal();
+	unix-dgram("/dev/log");
+};
+
+source net {
+	network_localhost();
+};
+
+source kernel {
+	file("/proc/kmsg" program_override("kernel"));
+};
+
+# NOTE: this is a real file, not RAM-only like OpenWrt's stock logd
+# buffer. Confirm `mount | grep /var` shows tmpfs before relying on this
+# being memory-backed - see README's "Where do the logs live" notes.
+destination messages {
+	file("/var/log/messages");
+};
+
+# Forward every local log line to the main router, where syslog-ng is
+# listening on UDP 514 (see syslog-ng-router.conf.example).
+destination d_router {
+	network("IP_ROUTER" port(514) transport("udp"));
+};
+
+log {
+	source(src);
+	source(net);
+	source(kernel);
+	destination(messages);
+	destination(d_router);
+};
+
+# Include any user settings last so that s/he can override or
+# supplement all "canned" settings inherited from the distribution.
+@include "/etc/syslog-ng.d/"

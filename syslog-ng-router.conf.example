@@ -1,0 +1,70 @@
+# syslog-ng config for the MAIN router only (the one running
+# enable_wifi_tracking + CentralWifiTracker).
+#
+# Role: listen on UDP 514 for events forwarded by every satellite AP
+# (see syslog-ng-satellite.conf.example), AND feed this router's own
+# local hostapd/kernel events into the same merged stream - that's what
+# "External system log server = 127.0.0.1" on the router itself achieves
+# in combination with this listening on 0.0.0.0:514.
+#
+# netpulse-presence.py never reads this file directly - it just runs
+# `logread -f` and expects every AP's hostapd lines (local and forwarded)
+# to show up there. This config is what makes that true.
+
+@version: current
+@include "scl.conf"
+
+options {
+	chain_hostnames(no);
+	create_dirs(yes);
+	keep_hostname(yes);
+	log_fifo_size(256);
+	log_msg_size(1024);
+	stats(freq(0));
+	flush_lines(0);
+	use_fqdn(no);
+};
+
+# syslog-ng gets messages from syslog-ng (internal) and from /dev/log
+source src {
+	internal();
+	unix-dgram("/dev/log");
+};
+
+source net {
+	network_localhost();
+};
+
+# Listens on UDP 514 for events forwarded by satellite APs (and by this
+# router's own logd, looped back via 127.0.0.1 - see README).
+source s_network {
+	network(
+		ip("0.0.0.0")
+		port(514)
+		transport("udp")
+		ip-protocol(6)
+	);
+};
+
+source kernel {
+	file("/proc/kmsg" program_override("kernel"));
+};
+
+# NOTE: this is a real file, not RAM-only like OpenWrt's stock logd
+# buffer. Confirm `mount | grep /var` shows tmpfs before relying on this
+# being memory-backed - see README's "Where do the logs live" notes.
+destination messages {
+	file("/var/log/messages");
+};
+
+log {
+	source(src);
+	source(net);
+	source(kernel);
+	destination(messages);
+	source(s_network);
+};
+
+# Include any user settings last so that s/he can override or
+# supplement all "canned" settings inherited from the distribution.
+@include "/etc/syslog-ng.d/"

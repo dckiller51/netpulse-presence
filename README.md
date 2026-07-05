@@ -24,13 +24,16 @@ a message — it never asks a question.
 
 ## How it works
 
-- **Wi-Fi** — a `WifiTracker` polls `ubus call hostapd.<iface> get_clients`
-  on a short interval (default 2s, `wifi_poll_interval`). This is *not*
-  the kind of polling the intro above is warning about: there is exactly
-  one always-fresh source of truth (the live hostapd client list), so
-  there's no possibility of two caches drifting apart. On a multi-AP
-  network you can instead run the `CentralWifiTracker` on your main
-  router (`wifi_tracking_mode: "central"`) — see below.
+- **Wi-Fi** — one router (your main router) runs `CentralWifiTracker`,
+  which ingests `AP-STA-CONNECTED`/`AP-STA-DISCONNECTED` events for
+  *every* AP on the network — itself and any satellite AP — over syslog,
+  and is the single source of truth for Wi-Fi presence network-wide. A
+  roam between two APs becomes one ordered pair of events instead of two
+  independent trackers racing their own timers, so there's no flicker.
+  Satellite APs don't run their own tracker at all — they just forward
+  their syslog to the main router, optionally paired with a lightweight
+  heartbeat (`enable_wifi_heartbeat`) that self-heals a lost event — see
+  [Wi-Fi tracking](#wi-fi-tracking-central) below.
 - **Wired** — a `WiredTracker` consumes a live `ip monitor neigh` stream, a
   genuine kernel event source that emits a line the instant any ARP/NDP
   neighbor entry changes state. An optional ICMP ping watchdog
@@ -52,6 +55,8 @@ a message — it never asks a question.
 | `netpulse-presence.py` | The presence-detection daemon itself. |
 | `netpulse-presence` | OpenWrt `/etc/init.d` procd service script. |
 | `netpulse-presence.settings.json.example` | Example configuration file. |
+| `syslog-ng-router.conf.example` | Example `/etc/syslog-ng.conf` for the main router — receives events forwarded by every satellite AP. |
+| `syslog-ng-satellite.conf.example` | Example `/etc/syslog-ng.conf` for a satellite AP — forwards its own events to the main router. |
 
 > This repository contains only the router-side agent. It does not include
 > a Home Assistant custom component — none is needed, since the script
@@ -122,23 +127,24 @@ you omit falls back to its default below.
 | `mqtt_username` / `mqtt_password` | `""` | MQTT credentials. |
 | `mqtt_base_topic` | `netpulse` | Topic prefix for all published messages. |
 | `router_name` | hostname | Identifies this router in topics/attributes. |
-| `dhcp_leases_file` | `/tmp/dhcp.leases` | dnsmasq leases file, for hostname/IP resolution. |
-| `uci_dhcp_file` | `""` | Optional path to a synced copy of `/etc/config/dhcp` (e.g. cron'd `scp` from the main router), used to resolve hostnames on a satellite AP with no local DHCP server. |
+| `dhcp_leases_file` | `/tmp/dhcp.leases` | dnsmasq leases file, for hostname/IP resolution. Only read when `enable_wifi_tracking` or `enable_wired_tracking` is `true` — irrelevant on a satellite running only `enable_wifi_heartbeat`. |
 | `log_level` | `INFO` | Python logging level. |
 
-### Wi-Fi tracking
+### Wi-Fi tracking (central)
+
+Wi-Fi presence is always tracked network-wide by a single router — there's
+no per-AP polling mode to choose between. Run these settings on your
+**main router only**; satellite APs use [`enable_wifi_heartbeat`](#satellite-ap-setup)
+instead.
 
 | Key | Default | Description |
 |---|---|---|
-| `enable_wifi_tracking` | `true` | Enable Wi-Fi presence tracking. |
-| `wifi_tracking_mode` | `local` | `local`: each AP tracks and publishes its own clients independently. `central`: this router alone is the single source of truth network-wide (see below). |
-| `wifi_poll_interval` | `2` | Seconds between `hostapd get_clients` polls in `local` mode. |
-| `wifi_grace_seconds` | `15` | Seconds to wait after a disconnect before declaring `not_home`, in `local` mode. |
-| `wifi_central_grace_seconds` | `60` | Same idea, but for `central` mode. |
+| `enable_wifi_tracking` | `true` | Enable Wi-Fi presence tracking. Set to `true` on the main router only — `false` on every satellite AP. |
+| `wifi_central_grace_seconds` | `60` | Seconds to wait after an `AP-STA-DISCONNECTED` before declaring `not_home`, unless a connect event for that MAC (on any AP) arrives first. |
 | `wifi_central_syslog_source_pattern` | `WifiAP-\w+` | Regex matching the syslog hostname field identifying which AP a log line came from. |
 | `wifi_central_ap_timeout_seconds` | `1200` | Drop an AP's reported clients if it hasn't logged anything in this long (dead-AP watchdog). |
-| `wifi_central_local_resync_seconds` | `90` | Periodically re-checks *this router's own* hostapd interfaces via `ubus` (like `local` mode does) and corrects any drift from a lost syslog line — re-confirming clients the event stream missed, or starting the grace-period departure for clients whose disconnect event never arrived. Set to `0` to disable. See [Handling missed events](#handling-missed-events-central-mode) below. |
-| `enable_wifi_heartbeat` | `false` | Enable **only on a satellite AP**, *instead of* `enable_wifi_tracking`. Periodically re-announces this AP's own hostapd clients over syslog so the central router can self-heal a lost event on a satellite it has no `ubus` access to. See [Handling missed events](#handling-missed-events-central-mode). |
+| `wifi_central_local_resync_seconds` | `90` | Periodically re-checks *this router's own* hostapd interfaces via `ubus` and corrects any drift from a lost syslog line — re-confirming clients the event stream missed, or starting the grace-period departure for clients whose disconnect event never arrived. Set to `0` to disable. See [Handling missed events](#handling-missed-events) below. |
+| `enable_wifi_heartbeat` | `false` | Enable **only on a satellite AP**, *instead of* `enable_wifi_tracking`. Periodically re-announces this AP's own hostapd clients over syslog so the central router can self-heal a lost event on a satellite it has no `ubus` access to. See [Handling missed events](#handling-missed-events). |
 | `wifi_heartbeat_interval` | `60` | Seconds between heartbeat re-announcements, when `enable_wifi_heartbeat` is `true`. |
 | `wifi_heartbeat_miss_threshold` | `2` | Consecutive missed cycles required before the heartbeat declares a client actually gone. Protects against a single transient `ubus` hiccup being mistaken for a real disconnect; a `ubus` failure that prevents checking an interface at all is never counted as a miss. |
 
@@ -166,33 +172,60 @@ next time that device's neighbor entry changes state.
 If you'd rather use an explicit MAC/IP-prefix whitelist instead, set
 `wired_static_leases_only: false` and fill in `wired_whitelist`.
 
-### Wi-Fi tracking modes: `local` vs `central`
+### Satellite AP setup
 
-**`local`** (default) — every router/AP polls its own hostapd clients and
-publishes its own verdict independently. Simple, but during a roam between
-two APs there are two separate grace timers racing each other, which can
-produce a brief `home → not_home → home` flicker.
+Wi-Fi presence is always tracked network-wide, from a single router — the
+main router ingests `AP-STA-CONNECTED`/`AP-STA-DISCONNECTED` events for
+*every* AP on the network (itself and any satellite APs) via `logread -f`,
+and is the single source of truth for Wi-Fi presence. A roam between two
+APs becomes one ordered pair of events, not two independent trackers
+racing their own timers — no flicker.
 
-**`central`** — run this on your main router only. It ingests
-`AP-STA-CONNECTED` / `AP-STA-DISCONNECTED` events for *every* AP on the
-network (itself and any satellite APs) via `logread -f`, and becomes the
-single source of truth for Wi-Fi presence network-wide. A roam becomes one
-ordered pair of events instead of two independent trackers racing — no
-flicker. To use it:
+Both the main router and every satellite AP run `syslog-ng` — the router
+to *receive* everyone's events, satellites to *forward* their own. To set
+up a satellite AP:
 
-1. On the main router, set `"wifi_tracking_mode": "central"`.
-2. On the main router, install and configure `syslog-ng` to listen on UDP
-   514 and to also feed its own local log to itself
-   (`External system log server = 127.0.0.1`).
-3. On each satellite AP, set System → Logging → **External system log
-   server** to the main router's IP, so its hostapd events get forwarded.
-4. Satellite APs must **not** run their own `WifiTracker`/
-   `CentralWifiTracker` in this mode — set `"enable_wifi_tracking": false`
-   on them. The main router is the only source of truth. Optionally, also
-   set `"enable_wifi_heartbeat": true` on each satellite — see
-   [Handling missed events](#handling-missed-events-central-mode) below.
+1. **On the main router**, install `syslog-ng` and use
+   [`syslog-ng-router.conf.example`](syslog-ng-router.conf.example) as
+   `/etc/syslog-ng.conf`. It listens on UDP 514 for events forwarded by
+   every satellite, and merges in this router's own local events too:
+   ```sh
+   opkg update
+   opkg install syslog-ng
+   ```
+   On some OpenWrt versions/feeds, `syslog-ng` and the stock `logd` both
+   ship a `/sbin/logread`, so `opkg` refuses to install one while the
+   other is present. If you hit that error, remove `logd` first:
+   ```sh
+   opkg remove logd
+   opkg install syslog-ng
+   ```
+   On other versions the two coexist fine (this is the more common case
+   in practice) — `logd` keeps running as normal, and `syslog-ng` just
+   listens on 514 alongside it. Only remove `logd` if `opkg` actually
+   reports a conflict; doing it unconditionally can change how `logread`
+   behaves (an in-memory-only `logd` buffer vs. whatever `syslog-ng`'s own
+   `logread` substitute reads from, e.g. a file).
+2. **On each satellite AP**, install `syslog-ng` the same way, and use
+   [`syslog-ng-satellite.conf.example`](syslog-ng-satellite.conf.example)
+   as `/etc/syslog-ng.conf`, with `IP_ROUTER` replaced by the main
+   router's actual LAN IP. It forwards this AP's own local events to the
+   main router over UDP 514 — it does not need to receive anything.
+3. Restart `syslog-ng` on both after editing its config:
+   ```sh
+   /etc/init.d/syslog-ng restart
+   ```
+4. Satellite APs must **not** run their own `CentralWifiTracker` — set
+   `"enable_wifi_tracking": false` on them. The main router is the only
+   source of truth. Optionally, also set `"enable_wifi_heartbeat": true`
+   on each satellite — see [Handling missed events](#handling-missed-events)
+   below.
 
-### Handling missed events (central mode)
+Both example configs write locally to `/var/log/messages` (a real file,
+not the in-memory buffer OpenWrt's stock `logd` uses) — confirm
+`mount | grep /var` shows `tmpfs` if you want to keep this RAM-only.
+
+### Handling missed events
 
 `central` mode is purely event-driven: it only reacts to
 `AP-STA-CONNECTED`/`AP-STA-DISCONNECTED` lines. Two failure modes are
@@ -276,8 +309,7 @@ No custom component is required.
   reach the MQTT broker (`netpulse/<router_name>/status` should read
   `online`) and that the device actually matches your wired/Wi-Fi tracking
   filters (static lease, whitelist, tracked interface, etc.).
-- If `wifi_tracking_mode: "central"` isn't picking up a satellite AP's
-  clients, verify that AP's syslog is actually reaching the main router
+- If a satellite AP's clients aren't being picked up, verify that AP's syslog is actually reaching the main router
   (`wifi_central_syslog_source_pattern` must match its hostname field).
 
 ## Changelog

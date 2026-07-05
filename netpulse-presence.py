@@ -65,22 +65,17 @@ DEFAULT_CONFIG = {
     "router_name": "",  # if empty, falls back to the device hostname
     "enable_wifi_tracking": True,
     "enable_wired_tracking": False,
-    # "local" (default, backward compatible): each AP polls its OWN
-    # hostapd clients via ubus and publishes its own verdict independently
-    # over MQTT - simple, but during a roam between two APs there are two
-    # separate grace timers racing each other, which can produce a brief
-    # home -> not_home -> home flicker.
-    # "central": this router (and ONLY the router should run this mode)
-    # ingests AP-STA-CONNECTED / AP-STA-DISCONNECTED events for ALL access
-    # points - itself plus any satellite AP - via syslog (see
+    # This router (and ONLY this router should have enable_wifi_tracking
+    # on) ingests AP-STA-CONNECTED / AP-STA-DISCONNECTED events for ALL
+    # access points - itself plus any satellite AP - via syslog (see
     # wifi_central_syslog_source_pattern below), and is the single source
-    # of truth for Wi-Fi presence network-wide. A roam becomes one ordered
-    # pair of events instead of two independent trackers racing - no
-    # flicker. Satellite APs must NOT run their own WifiTracker/
-    # CentralWifiTracker in this mode; they only need their local syslog
-    # forwarded to this router (External system log server = this
-    # router's IP, see syslog-ng setup notes near CentralWifiTracker).
-    "wifi_tracking_mode": "local",
+    # of truth for Wi-Fi presence network-wide: a roam between two APs is
+    # one ordered pair of events, never two independent trackers racing.
+    # Satellite APs must NOT run their own CentralWifiTracker; set
+    # enable_wifi_tracking=False on them and use enable_wifi_heartbeat
+    # instead (see below) - they only need their local syslog forwarded
+    # to this router (External system log server = this router's IP, see
+    # syslog-ng setup notes near CentralWifiTracker).
     # Regex matching the syslog hostname/source field that identifies
     # which AP a given log line came from. The default matches any
     # "WifiAP-NN"-style hostname; adjust if your AP naming differs.
@@ -101,26 +96,24 @@ DEFAULT_CONFIG = {
     # (a dropped UDP syslog packet, a syslog-ng restart, a brief network
     # blip) a device can stay stuck "home" forever, since nothing will
     # ever tell the tracker it left. This periodically re-checks this
-    # router's OWN local hostapd interfaces via ubus (the same call
-    # WifiTracker uses) and reconciles any drift: it re-confirms clients
-    # the event stream missed, and starts the normal grace-period
-    # departure for clients the event stream never told us left. This
-    # only self-heals THIS router's own radios - a satellite AP's clients
-    # still rely on its syslog events reaching us (see
-    # wifi_central_ap_timeout_seconds for the "AP gone completely dark"
-    # case). Set to 0 to disable.
+    # router's OWN local hostapd interfaces via ubus and reconciles any
+    # drift: it re-confirms clients the event stream missed, and starts
+    # the normal grace-period departure for clients the event stream
+    # never told us left. This only self-heals THIS router's own radios -
+    # a satellite AP's clients still rely on its syslog events reaching us
+    # (see wifi_central_ap_timeout_seconds for the "AP gone completely
+    # dark" case). Set to 0 to disable.
     "wifi_central_local_resync_seconds": 90,
-    # Run this on a SATELLITE AP in central mode (alongside
-    # enable_wifi_tracking=False) to close the one remaining gap
-    # wifi_central_local_resync_seconds can't reach: a lost individual
-    # event on a router the central tracker has no ubus access to. Every
-    # wifi_heartbeat_interval seconds, this router re-announces its own
-    # currently-authorized hostapd clients over syslog using the exact
-    # same wording a real AP-STA-CONNECTED/AP-STA-DISCONNECTED line uses -
-    # so it flows through the same syslog-ng forwarding and is parsed by
-    # CentralWifiTracker exactly like a genuine hostapd event, no central-
-    # side changes needed. Independent of enable_wifi_tracking/
-    # wifi_tracking_mode; safe to enable even where those are False.
+    # Run this on a SATELLITE AP (alongside enable_wifi_tracking=False) to
+    # close the one remaining gap wifi_central_local_resync_seconds can't
+    # reach: a lost individual event on a router the central tracker has
+    # no ubus access to. Every wifi_heartbeat_interval seconds, this
+    # router re-announces its own currently-authorized hostapd clients
+    # over syslog using the exact same wording a real
+    # AP-STA-CONNECTED/AP-STA-DISCONNECTED line uses - so it flows through
+    # the same syslog-ng forwarding and is parsed by CentralWifiTracker
+    # exactly like a genuine hostapd event, no central-side changes
+    # needed. Safe to enable even where enable_wifi_tracking is False.
     "enable_wifi_heartbeat": False,
     "wifi_heartbeat_interval": 60,
     # Require this many CONSECUTIVE missed cycles before treating a
@@ -145,14 +138,8 @@ DEFAULT_CONFIG = {
     "wired_ping_interval": 30,      # seconds between ping sweeps
     "wired_ping_timeout": 2,        # seconds to wait for a ping reply
     "wired_ping_failures": 3,       # consecutive failures before not_home
-    "wifi_poll_interval": 2,
-    "wifi_grace_seconds": 15,
     "wired_grace_seconds": 30,
     "dhcp_leases_file": "/tmp/dhcp.leases",
-    "uci_dhcp_file": "",  # optional: path to a synced copy of /etc/config/dhcp
-                          # (e.g. via a cron'd scp from the main router) for
-                          # reliable hostnames on a satellite AP with no
-                          # local DHCP server.
     "log_level": "INFO",
 }
 
@@ -240,145 +227,6 @@ def load_dhcp_leases(leases_file: str) -> dict:
     return leases
 
 
-def load_uci_dhcp_hosts(uci_dhcp_file: str) -> dict:
-    """Parse a copy of /etc/config/dhcp (UCI format) into
-    {MAC: {"ip":..., "hostname":...}}.
-
-    Reads "config host" sections - the same static-lease entries visible in
-    LuCI's Static Leases page - picking up the user-assigned `option name`
-    rather than whatever (if anything) the device itself advertises over
-    DHCP. This is more reliable than dnsmasq.leases for devices that never
-    send a DHCP hostname option (common for ESP32/IoT-style devices, whose
-    dnsmasq.leases entry would otherwise show "*").
-
-    Useful on a satellite AP with no local DHCP server: this file can be
-    periodically copied over from the main router (e.g. via a cron'd scp)
-    so the AP can still resolve hostnames for devices it sees on Wi-Fi,
-    without needing its own DHCP/lease data.
-    """
-    hosts = {}
-    try:
-        with open(uci_dhcp_file) as f:
-            content = f.read()
-    except OSError as exc:
-        log.debug("Could not read UCI dhcp file %s: %s", uci_dhcp_file, exc)
-        return hosts
-
-    # This function accepts TWO different UCI text formats, since either
-    # could reasonably end up being the file synced over from the main
-    # router depending on how the sync command was written:
-    #
-    #   1. The raw /etc/config/dhcp config file format:
-    #        config host
-    #            option name 'truenas'
-    #            option mac 'BC:24:11:17:F8:40'
-    #            option ip '192.168.2.68'
-    #
-    #   2. The output of `uci show dhcp`:
-    #        dhcp.@host[37]=host
-    #        dhcp.@host[37].name='truenas'
-    #        dhcp.@host[37].mac='BC:24:11:17:F8:40'
-    #        dhcp.@host[37].ip='192.168.2.68'
-    #
-    # Sections are grouped by "config host" blocks in format 1, or by the
-    # @host[N] INDEX in format 2 - both are tracked as `current_section_key`
-    # below so a single shared accumulator/flush mechanism handles both.
-
-    sections: dict[str, dict] = {}
-    current_key = None
-
-    option_re = re.compile(r"^(?:option|list)\s+(\w+)\s+'([^']*)'")
-    uci_show_re = re.compile(r"^dhcp\.@host\[(\d+)\](?:\.(\w+))?='?([^'\n]*)'?$")
-
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        # Format 1: "config host" starts a new section; any other
-        # "config ..." (e.g. "config dnsmasq") ends host-section tracking.
-        if line.startswith("config "):
-            current_key = "luci-host" if line.startswith("config host") else None
-            if current_key:
-                sections.setdefault(current_key, {})
-                # Multiple "config host" blocks would otherwise collide on
-                # the same dict key, so give each one a unique key as soon
-                # as we see it via a counter.
-                current_key = f"luci-host-{len(sections)}"
-                sections[current_key] = {}
-            continue
-        if current_key and current_key.startswith("luci-host"):
-            m = option_re.match(line)
-            if m:
-                field, value = m.group(1), m.group(2)
-                if field == "mac":
-                    # UCI represents a multi-value "mac" as several
-                    # separate "list mac '...'" lines (one MAC per line),
-                    # as opposed to "option mac '...'" which can itself
-                    # contain several space-separated MACs on one line.
-                    # Accumulate every value seen across all such lines so
-                    # none are silently dropped if a section has more than
-                    # one "list mac" entry.
-                    sections[current_key].setdefault("mac", [])
-                    sections[current_key]["mac"].append(value)
-                else:
-                    sections[current_key][field] = value
-            continue
-
-        # Format 2: `uci show dhcp` lines.
-        m = uci_show_re.match(line)
-        if m:
-            index, field, value = m.group(1), m.group(2), m.group(3)
-            key = f"uci-host-{index}"
-            sections.setdefault(key, {})
-            if field == "mac":
-                sections[key].setdefault("mac", [])
-                sections[key]["mac"].append(value)
-            elif field:
-                sections[key][field] = value
-            continue
-
-    for fields in sections.values():
-        mac_field = fields.get("mac")
-        if not mac_field:
-            continue
-        # mac_field is now always a list of one-or-more raw mac strings
-        # (each of which may itself be space-separated, e.g. "option mac
-        # 'AA:.. BB:..'" on one line). Flatten and take the first overall -
-        # matching the simplification used elsewhere for static-lease
-        # matching, where only one representative MAC is needed per name.
-        all_macs = [m for raw in mac_field for m in raw.split()]
-        if not all_macs:
-            continue
-        mac = all_macs[0].upper()
-        entry = {}
-        if fields.get("ip"):
-            entry["ip"] = fields["ip"]
-        if fields.get("name"):
-            entry["hostname"] = fields["name"]
-        if entry:
-            hosts[mac] = entry
-
-    return hosts
-
-
-def merge_lease_sources(dnsmasq_leases: dict, uci_hosts: dict) -> dict:
-    """Combine dnsmasq.leases and UCI static-host data into one lookup.
-
-    UCI host names win when present (they're user-assigned and reliable
-    even for devices that never advertise a DHCP hostname), falling back to
-    dnsmasq.leases data - and its own "*" => MAC fallback - for anything
-    not covered by a static lease.
-    """
-    merged: dict = {mac: dict(data) for mac, data in dnsmasq_leases.items()}
-    for mac, uci_data in uci_hosts.items():
-        entry = merged.setdefault(mac, {})
-        if uci_data.get("hostname"):
-            entry["hostname"] = uci_data["hostname"]
-        if uci_data.get("ip") and not entry.get("ip"):
-            entry["ip"] = uci_data["ip"]
-    return merged
-
 
 def load_arp_table() -> dict:
     """Read the local kernel neighbor table for a MAC -> IP mapping.
@@ -442,7 +290,7 @@ def resolve_device_info(mac: str, leases: dict, cache: dict) -> tuple[str, str]:
     """Return (ip, hostname) for a MAC, with graceful fallbacks.
 
     Shared helper used by CentralWifiTracker. Mirrors
-    WifiTracker._resolve_device_info's logic (lease lookup, then ARP +
+    the tracker's own _resolve_device_info logic (lease lookup, then ARP +
     reverse-DNS fallback) but as a free function so it doesn't need to live
     on a particular tracker instance - CentralWifiTracker tracks multiple
     remote APs' clients, not just its own.
@@ -574,8 +422,8 @@ class Publisher:
         """Subscribe to every router's Wi-Fi-sighting broadcasts and feed
         them into the given registry. Used by a router running the wired
         tracker, so it also knows about Wi-Fi clients seen by OTHER
-        routers/APs on the same network - not just its own WifiTracker, if
-        any is even running locally.
+        routers/APs on the same network - not just its own
+        CentralWifiTracker, if any is even running locally.
         """
         self._wifi_registry_to_subscribe = wifi_registry
         # If we're already connected by the time this is called, subscribe
@@ -656,16 +504,16 @@ class WifiMacRegistry:
     """Thread-safe short-term memory of MACs seen as Wi-Fi clients.
 
     This registry can be fed from two sources:
-      1. The local WifiTracker on the SAME router process (mark_seen()).
-      2. Other routers' WifiTrackers, via MQTT (mark_seen_remote()) - this
-         is essential in a multi-AP setup: Wi-Fi and wired tracking can run
-         on different physical routers (e.g. Wi-Fi tracked by a satellite
-         AP, wired tracked by the main router), so an in-memory-only
-         registry local to one process would never see Wi-Fi sightings
-         that happened on another router. Without this cross-router
-         sharing, a device connected via Wi-Fi on AP-02 would still get
-         misclassified as "wired" by the main router, which also sees its
-         MAC on the shared br-lan bridge.
+      1. This router's own CentralWifiTracker/WifiHeartbeat (mark_seen()).
+      2. Other routers, via MQTT (mark_seen_remote()) - this is essential
+         in a multi-AP setup: Wi-Fi and wired tracking can run on
+         different physical routers (e.g. Wi-Fi tracked on a satellite
+         AP via enable_wifi_heartbeat, wired tracked by the main router),
+         so an in-memory-only registry local to one process would never
+         see Wi-Fi sightings that happened on another router. Without
+         this cross-router sharing, a device connected via Wi-Fi on
+         AP-02 would still get misclassified as "wired" by the main
+         router, which also sees its MAC on the shared br-lan bridge.
     """
 
     def __init__(self, grace_seconds: float, on_mark_seen=None):
@@ -677,7 +525,7 @@ class WifiMacRegistry:
         self._on_mark_seen = on_mark_seen
 
     def mark_seen(self, mac: str) -> None:
-        """Record a Wi-Fi sighting from THIS router's own WifiTracker."""
+        """Record a Wi-Fi sighting from THIS router's own CentralWifiTracker."""
         with self._lock:
             self._last_seen[mac] = time.monotonic()
         if self._on_mark_seen:
@@ -707,13 +555,11 @@ class WifiMacRegistry:
 class CentralWifiTracker:
     """Network-wide Wi-Fi presence, single source of truth, ROUTER ONLY.
 
-    This is the Python re-implementation of the wrtpresence_main.sh /
-    syslog-ng approach: instead of each AP independently polling its own
-    hostapd clients and racing its own grace timer against every other
-    AP's tracker (the "local" mode, see WifiTracker), this class runs on
-    the router ONLY and ingests AP-STA-CONNECTED / AP-STA-DISCONNECTED
-    events for every AP on the network - itself and any satellite AP -
-    through a single, time-ordered stream: `logread -f`.
+    Instead of each AP independently polling its own hostapd clients and
+    racing its own grace timer against every other AP's tracker, this
+    class runs on the router ONLY and ingests AP-STA-CONNECTED /
+    AP-STA-DISCONNECTED events for every AP on the network - itself and
+    any satellite AP - through a single, time-ordered stream: `logread -f`.
 
     Why this fixes roaming "blips": a roam from AP-A to AP-B produces two
     events (DISCONNECTED on A, then CONNECTED on B) a few seconds apart in
@@ -721,25 +567,23 @@ class CentralWifiTracker:
     event immediately cancels any pending "away" timer for that MAC,
     regardless of which AP it was previously tied to. There is no second,
     independently-timed tracker that might publish "not_home" before the
-    new sighting arrives - which is what could happen in "local" mode when
-    two separate per-AP processes raced their own grace_seconds windows.
+    new sighting arrives.
 
-    Prerequisites (see wrtpresence_main.sh's header comments for the full
-    walkthrough):
+    Prerequisites:
       - This router: syslog-ng installed, configured to listen on UDP 514
         AND to feed itself (External system log server = 127.0.0.1).
       - Each satellite AP: System > Logging > External system log server
         = this router's IP, so its hostapd events get forwarded here.
-      - Satellite APs must NOT run their own WifiTracker/CentralWifiTracker
-        instance in this mode - this router is the only source of truth.
+      - Satellite APs must NOT run their own CentralWifiTracker instance -
+        this router is the only source of truth. They should instead run
+        enable_wifi_heartbeat (see WifiHeartbeat).
 
     Because this is purely event-driven, it also runs a periodic LOCAL
     resync (see wifi_central_local_resync_seconds / _local_resync) that
     re-checks THIS router's own hostapd interfaces via ubus and corrects
-    any drift caused by a lost syslog line - the same self-healing that
-    the "local" WifiTracker gets for free simply by re-polling every
-    cycle. This only covers this router's own radios; a satellite AP's
-    clients still depend on its events actually reaching us.
+    any drift caused by a lost syslog line. This only covers this
+    router's own radios; a satellite AP's clients still depend on its
+    events actually reaching us.
 
     A satellite AP rebooting is a special case of that: hostapd dies
     without logging a clean AP-STA-DISCONNECTED for anyone, so its
@@ -785,7 +629,7 @@ class CentralWifiTracker:
         self._stop = threading.Event()
         self._watchdog_thread = None
 
-    # -- public API, mirrors WifiTracker/WiredTracker's run()/stop() shape --
+    # -- public API, mirrors WiredTracker's run()/stop() shape --
 
     def run(self):
         log.info(
@@ -920,7 +764,7 @@ class CentralWifiTracker:
         if already_home and same_station:
             # No-op republish would just spam MQTT with no new
             # information; skip it (same dedup spirit as
-            # WifiTracker._maybe_transition's state_unchanged check).
+            # _maybe_transition's state_unchanged check).
             return
 
         log.info("Central Wi-Fi: %s connected on %s/%s", mac, station, iface)
@@ -980,7 +824,7 @@ class CentralWifiTracker:
             # NOTE: this is the hostapd INTERFACE name (e.g. "phy2-ap0"),
             # not the actual SSID string. hostapd's AP-STA-CONNECTED /
             # AP-STA-DISCONNECTED syslog lines don't include the SSID at
-            # all, only the interface - unlike the "local" WifiTracker,
+            # all, only the interface -
             # which can call `ubus call iwinfo info` to resolve a real
             # SSID. Resolving the interface -> SSID mapping here would
             # require either a local ubus call (only valid for THIS
@@ -1073,7 +917,7 @@ class CentralWifiTracker:
 
     def _get_local_authorized_clients(self):
         """Return ({mac: phy_iface}, queried_ifaces) for this router's own
-        radios, queried directly via ubus (the same call WifiTracker
+        radios, queried directly via ubus (the same call WifiHeartbeat
         uses) rather than relying on hostapd's syslog events. Returns
         (None, None) if ubus itself was unreachable this cycle.
         """
@@ -1154,25 +998,25 @@ class CentralWifiTracker:
 
 
 class WifiHeartbeat:
-    """Runs on a satellite AP (in central mode) alongside its syslog-ng
-    forwarding, to close the one gap wifi_central_local_resync_seconds
-    can't reach from the main router: a single AP-STA-CONNECTED or
-    AP-STA-DISCONNECTED line getting lost on a satellite that's otherwise
-    running fine.
+    """Runs on a satellite AP alongside its syslog-ng forwarding, to close
+    the one gap wifi_central_local_resync_seconds can't reach from the
+    main router: a single AP-STA-CONNECTED or AP-STA-DISCONNECTED line
+    getting lost on a satellite that's otherwise running fine.
 
     Every wifi_heartbeat_interval seconds it queries this router's own
-    hostapd interfaces via ubus - the same call WifiTracker/local_resync
-    use - and re-announces the result over syslog using the EXACT wording
-    a genuine hostapd AP-STA-CONNECTED/AP-STA-DISCONNECTED line uses. That
-    synthetic line then flows through the satellite's existing syslog-ng
-    forwarding to the central router completely unchanged, and gets
-    parsed by CentralWifiTracker._handle_line exactly like a real hostapd
-    event - already-home clients are a cheap no-op there, and a client
-    hostapd no longer lists starts the normal grace-period departure.
+    hostapd interfaces via ubus - the same call the main router's
+    _local_resync uses - and re-announces the result over syslog using
+    the EXACT wording a genuine hostapd AP-STA-CONNECTED/AP-STA-DISCONNECTED
+    line uses. That synthetic line then flows through the satellite's
+    existing syslog-ng forwarding to the central router completely
+    unchanged, and gets parsed by CentralWifiTracker._handle_line exactly
+    like a real hostapd event - already-home clients are a cheap no-op
+    there, and a client hostapd no longer lists starts the normal
+    grace-period departure.
 
-    This is intentionally independent of enable_wifi_tracking and
-    wifi_tracking_mode: a satellite AP in central mode runs this INSTEAD
-    of its own WifiTracker/CentralWifiTracker, not alongside it.
+    This is intentionally independent of enable_wifi_tracking: a
+    satellite AP runs this INSTEAD of its own CentralWifiTracker, not
+    alongside it.
     """
 
     def __init__(self, config: dict):
@@ -1295,179 +1139,6 @@ class WifiHeartbeat:
         self._stop.set()
 
 
-class WifiTracker:
-    """Tracks Wi-Fi client presence via `ubus call hostapd.<iface> get_clients`."""
-
-    def __init__(self, config: dict, publisher: Publisher, leases: dict,
-                 wifi_registry: WifiMacRegistry | None = None):
-        self.config = config
-        self.publisher = publisher
-        self.leases = leases
-        self.wifi_registry = wifi_registry
-        self._resolved_cache: dict[str, tuple[str, str]] = {}
-        self._last_published_router: dict[str, str] = {}
-        self.poll_interval = config["wifi_poll_interval"]
-        self.grace_seconds = config["wifi_grace_seconds"]
-        self.router_name = config["router_name"]
-        self._last_seen = {}  # mac -> monotonic timestamp
-        self._current_state = {}  # mac -> "home"/"not_home"
-        self._ssid_by_iface = {}
-        self._stop = threading.Event()
-
-    def _discover_interfaces(self) -> list:
-        try:
-            out = run(["ubus", "list"])
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-            log.error("Could not list ubus objects: %s", exc)
-            return []
-        return [line.strip() for line in out.splitlines() if line.strip().startswith("hostapd.")]
-
-    def _get_ssid(self, iface_obj: str) -> str:
-        if iface_obj in self._ssid_by_iface:
-            return self._ssid_by_iface[iface_obj]
-        phy_iface = iface_obj.split(".", 1)[1] if "." in iface_obj else iface_obj
-        ssid = phy_iface
-        try:
-            out = run(["ubus", "call", "iwinfo", "info", json.dumps({"device": phy_iface})])
-            data = json.loads(out)
-            ssid = data.get("ssid", phy_iface)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError,
-                json.JSONDecodeError):
-            pass
-        self._ssid_by_iface[iface_obj] = ssid
-        return ssid
-
-    def _poll_once(self):
-        ifaces = self._discover_interfaces()
-        now = time.monotonic()
-        seen_this_cycle = set()
-
-        for iface_obj in ifaces:
-            try:
-                out = run(["ubus", "call", iface_obj, "get_clients"])
-                data = json.loads(out)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
-                     OSError, json.JSONDecodeError) as exc:
-                log.debug("Could not query %s: %s", iface_obj, exc)
-                continue
-
-            clients = data.get("clients", {})
-            ssid = self._get_ssid(iface_obj)
-
-            for mac, info in clients.items():
-                if not info.get("authorized"):
-                    continue
-                mac_upper = mac.upper()
-                seen_this_cycle.add(mac_upper)
-                self._last_seen[mac_upper] = now
-                # Only broadcast a fresh Wi-Fi sighting over MQTT when this
-                # MAC was NOT already in the registry's grace window. This
-                # is what previously caused a publish on every single 2s
-                # poll cycle for every connected device (mark_seen() was
-                # called unconditionally here), flooding the broker with
-                # near-continuous traffic instead of only signaling actual
-                # state changes.
-                if self.wifi_registry and not self.wifi_registry.is_recently_wifi(mac_upper):
-                    self.wifi_registry.mark_seen(mac_upper)
-                elif self.wifi_registry:
-                    # Still refresh the local timestamp (without
-                    # re-broadcasting) so the grace window keeps sliding
-                    # forward while the device remains connected.
-                    self.wifi_registry.mark_seen_remote(mac_upper)
-                self._maybe_transition(mac_upper, "home", ssid)
-
-        self._check_grace_period(seen_this_cycle, now)
-
-    def _check_grace_period(self, seen_this_cycle: set, now: float):
-        for mac, last_seen in list(self._last_seen.items()):
-            if mac in seen_this_cycle:
-                continue
-            if self._current_state.get(mac) != "home":
-                continue
-            if now - last_seen > self.grace_seconds:
-                self._maybe_transition(mac, "not_home", None)
-
-    def _resolve_device_info(self, mac: str) -> tuple[str, str]:
-        """Return (ip, hostname) for a MAC, with graceful fallbacks."""
-        if mac in self._resolved_cache:
-            return self._resolved_cache[mac]
-
-        lease = self.leases.get(mac)
-        if lease and lease.get("hostname") and lease.get("ip"):
-            result = (lease["ip"], lease["hostname"])
-            self._resolved_cache[mac] = result
-            return result
-
-        ip = "unknown"
-        hostname = mac.replace(":", "")
-        has_resolved_real_name = False
-
-        arp_table = load_arp_table()
-        ip_from_arp = arp_table.get(mac)
-        if ip_from_arp:
-            ip = ip_from_arp
-            resolved = resolve_hostname_via_dns(ip_from_arp)
-            if resolved:
-                hostname = resolved
-                has_resolved_real_name = True
-
-        result = (ip, hostname)
-        
-        if has_resolved_real_name:
-            self._resolved_cache[mac] = result
-
-        return result
-
-    def _maybe_transition(self, mac: str, state: str, ssid: str | None):
-        # Republish not just when home/not_home actually changes, but also
-        # when this router becomes the device's current source - e.g. a
-        # successful FT (802.11r) roam between routers is often completely
-        # seamless from the device's perspective (no disconnect/reconnect
-        # cycle at all on the new router's side), so the state itself never
-        # flips to not_home. Without this check, a device that silently
-        # roamed to a different router would keep displaying its OLD
-        # source_router/ssid/ip forever, since nothing ever triggered a
-        # republish.
-        state_unchanged = self._current_state.get(mac) == state
-        router_unchanged = self._last_published_router.get(mac) == self.router_name
-        if state_unchanged and router_unchanged:
-            return
-        self._current_state[mac] = state
-        self._last_published_router[mac] = self.router_name
-
-        ip, hostname = self._resolve_device_info(mac)
-        attributes = {
-            "mac": mac,
-            "source_type": "wifi",
-            "source_router": self.router_name,
-            "ip": ip,
-            "hostname": hostname,
-            # Toujours inclure la clé "ssid" (à None si inconnu), plutôt que
-            # de l'omettre entièrement: certaines cartes Lovelace tierces
-            # (ex. flex-table-card) gèrent mal un accès à une clé totalement
-            # ABSENTE d'un attribut JSON différemment d'une clé présente
-            # valant null/None, ce qui peut produire un rendu cassé côté
-            # frontend (cellule "undefined") sur les entités qui n'ont
-            # jamais eu cette clé du tout.
-            "ssid": ssid if ssid else None,
-        }
-
-        self.publisher.publish_state(mac, state, attributes)
-
-    def run(self):
-        log.info("Wi-Fi tracker started (poll interval=%ss, grace=%ss)",
-                  self.poll_interval, self.grace_seconds)
-        while not self._stop.is_set():
-            try:
-                self._poll_once()
-            except Exception:
-                log.exception("Unexpected error in Wi-Fi poll loop")
-            self._stop.wait(self.poll_interval)
-
-    def stop(self):
-        self._stop.set()
-
-
 # --------------------------------------------------------------------------
 # Wired tracker (`ip monitor neigh` - true kernel event stream)
 # --------------------------------------------------------------------------
@@ -1556,7 +1227,7 @@ class WiredTracker:
             "hostname": lease.get("hostname", mac.replace(":", "")),
             # Toujours présente (à None) pour que le payload "wired" ait la
             # même forme de clés que le payload "wifi" - voir le commentaire
-            # équivalent dans WifiTracker._maybe_transition.
+            # équivalent dans _maybe_transition.
             "ssid": None,
         }
         self.publisher.publish_state(mac, state, attributes)
@@ -1802,20 +1473,25 @@ def main():
     config = load_config()
     
     log.info("Starting NetPulse Presence Hub on %s", config["router_name"])
-    
-    leases = load_dhcp_leases(config["dhcp_leases_file"])
-    if config.get("uci_dhcp_file"):
-        uci_hosts = load_uci_dhcp_hosts(config["uci_dhcp_file"])
-        leases = merge_lease_sources(leases, uci_hosts)
-        log.info("Merged %d UCI static-host name(s) into lease data", len(uci_hosts))
-    static_leases = load_static_lease_macs() if config["wired_static_leases_only"] else set()
+
+    # Only CentralWifiTracker/WiredTracker resolve hostnames
+    # via leases - a satellite AP running ONLY enable_wifi_heartbeat has
+    # no use for any of this (WifiHeartbeat never even sees `leases`), so
+    # skip the work entirely rather than parsing DHCP/UCI files for
+    # nothing on every start.
+    needs_leases = config["enable_wifi_tracking"] or config["enable_wired_tracking"]
+    leases = {}
+    static_leases = set()
+    if needs_leases:
+        leases = load_dhcp_leases(config["dhcp_leases_file"])
+        static_leases = load_static_lease_macs() if config["wired_static_leases_only"] else set()
     
     publisher = Publisher(config)
     publisher.connect()
 
     # Wi-Fi and Ethernet share the same br-lan bridge, so a Wi-Fi client's
     # MAC is visible to ANY router's wired tracker on the network - not
-    # just the one running that client's own WifiTracker. In a multi-AP
+    # just the router running CentralWifiTracker. In a multi-AP
     # setup it's common for Wi-Fi tracking (on a satellite AP) and wired
     # tracking (on the main router) to run as entirely separate processes
     # on different machines, so a purely in-memory, per-process registry
@@ -1823,24 +1499,12 @@ def main():
     # router broadcasts its own Wi-Fi sightings over MQTT
     # (publish_wifi_seen), and any router running a wired tracker
     # subscribes to ALL routers' broadcasts (subscribe_wifi_seen) to build
-    # a registry that reflects the whole network, not just itself.
     # The cross-router Wi-Fi dedup registry's grace window must outlive
-    # whichever Wi-Fi tracker is ACTUALLY running, so a wired tracker never
+    # CentralWifiTracker's own grace period, so a wired tracker never
     # mistakenly re-claims a MAC as wired in the gap between two Wi-Fi
-    # sightings. Reading wifi_grace_seconds unconditionally here was a bug
-    # in central mode: that key only governs the legacy per-AP WifiTracker,
-    # and could be shorter than wifi_central_grace_seconds (the value that
-    # ACTUALLY matters when CentralWifiTracker is the one running) - this
-    # let the registry's window expire before a slower central-mode grace
-    # period elapsed, briefly handing a still-Wi-Fi MAC's state back to
-    # WiredTracker.
-    active_wifi_grace = (
-        config["wifi_central_grace_seconds"]
-        if config.get("wifi_tracking_mode") == "central"
-        else config["wifi_grace_seconds"]
-    )
+    # sightings.
     wifi_registry = WifiMacRegistry(
-        grace_seconds=active_wifi_grace + 10,
+        grace_seconds=config["wifi_central_grace_seconds"] + 10,
         on_mark_seen=publisher.publish_wifi_seen,
     )
     if config["enable_wired_tracking"]:
@@ -1850,20 +1514,14 @@ def main():
     threads = []
 
     if config["enable_wifi_tracking"]:
-        mode = config.get("wifi_tracking_mode", "local")
-        if mode == "central":
-            # Router-only mode: single source of truth for Wi-Fi presence
-            # across all APs, fed by syslog-ng-forwarded hostapd events.
-            # See CentralWifiTracker's docstring for the required setup
-            # (syslog-ng on this router, satellite APs forwarding their
-            # logs here). Satellite APs should have
-            # enable_wifi_tracking=False in this mode - they no longer run
-            # any Wi-Fi tracker of their own.
-            wifi_tracker = CentralWifiTracker(config, publisher, leases, wifi_registry)
-            t = threading.Thread(target=wifi_tracker.run, name="CentralWifiTracker", daemon=True)
-        else:
-            wifi_tracker = WifiTracker(config, publisher, leases, wifi_registry)
-            t = threading.Thread(target=wifi_tracker.run, name="WifiTracker", daemon=True)
+        # Single source of truth for Wi-Fi presence across all APs, fed by
+        # syslog-ng-forwarded hostapd events. See CentralWifiTracker's
+        # docstring for the required setup (syslog-ng on this router,
+        # satellite APs forwarding their logs here). This only ever runs
+        # on the main router - satellite APs run enable_wifi_heartbeat
+        # instead, never their own tracker.
+        wifi_tracker = CentralWifiTracker(config, publisher, leases, wifi_registry)
+        t = threading.Thread(target=wifi_tracker.run, name="CentralWifiTracker", daemon=True)
         trackers.append(wifi_tracker)
         threads.append(t)
 
@@ -1875,7 +1533,7 @@ def main():
 
     if config.get("enable_wifi_heartbeat"):
         # A satellite AP in central mode runs this INSTEAD of its own
-        # WifiTracker/CentralWifiTracker - it re-announces its own hostapd
+        # CentralWifiTracker - it re-announces its own hostapd
         # clients over syslog so the main router's CentralWifiTracker can
         # self-heal a lost individual event, without needing ubus access
         # to this router. See WifiHeartbeat's docstring.
